@@ -1,0 +1,149 @@
+#include <iostream>
+#include <vector>
+#include <sstream>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <bitset>
+
+using namespace std;
+
+struct State {
+    int idx;
+    char arr;
+    int drawCount;        // 일반 뽑기 횟수
+    int tenPlusOneCount;  // 10+1 뽑기 횟수
+    int collectedMask;    // 비트마스크 (획득한 목표 아이템)
+    vector<string> route;
+
+    bool operator>(const State& other) const {
+        return (drawCount + tenPlusOneCount) > (other.drawCount + other.tenPlusOneCount);
+    }
+};
+
+vector<string> parseItems(const string& line) {
+    vector<string> result;
+    stringstream ss(line);
+    string token;
+    while (getline(ss, token, '1')) {
+        if (!token.empty()) result.push_back(token);
+    }
+    return result;
+}
+
+inline char flipArr(char a) {
+    return (a == 'A' ? 'C' : 'A');
+}
+
+int main() {
+    unordered_map<char, vector<string>> pools;
+    vector<char> labels = { 'A', 'B', 'C', 'D' };
+
+    cout << "===== 배열 입력 =====\n";
+    for (char label : labels) {
+        cout << "배열 " << label << ": ";
+        string line; getline(cin, line);
+        pools[label] = parseItems(line);
+    }
+
+    cout << "\n목표 아이템 입력 (1 구분): ";
+    string goalLine; getline(cin, goalLine);
+    vector<string> goalVec = parseItems(goalLine);
+
+    unordered_map<string, int> goalIdx;
+    for (int i = 0; i < (int)goalVec.size(); ++i) goalIdx[goalVec[i]] = i;
+    int goalMaskFull = (1 << (int)goalVec.size()) - 1;
+
+    int maxLen = 0;
+    for (auto& p : pools) maxLen = max(maxLen, (int)p.second.size());
+    vector<vector<vector<bool>>> visited(
+        2, vector<vector<bool>>(maxLen + 20, vector<bool>(1 << goalVec.size(), false))
+    );
+
+    priority_queue<State, vector<State>, greater<State>> pq;
+    pq.push({ 0, 'A', 0, 0, 0, {} });
+
+    while (!pq.empty()) {
+        State cur = pq.top(); pq.pop();
+        int arrIdx = (cur.arr == 'A' ? 0 : 1);
+        if (cur.idx >= (int)pools[cur.arr].size()) continue;
+        if (visited[arrIdx][cur.idx][cur.collectedMask]) continue;
+        visited[arrIdx][cur.idx][cur.collectedMask] = true;
+
+        if (cur.collectedMask == goalMaskFull) {
+            cout << "\n최소 뽑기 횟수: " << cur.drawCount + cur.tenPlusOneCount << "회\n";
+            cout << "일반 뽑기: " << cur.drawCount << "회 | 10+1 뽑기: " << cur.tenPlusOneCount / 10 << "회\n\n";
+            cout << "[뽑기 경로]\n";
+            for (auto& step : cur.route) cout << "- " << step << "\n";
+            cout << "\n[획득 현황]\n";
+            for (auto& item : goalVec) {
+                bool got = (cur.collectedMask & (1 << goalIdx[item])) != 0;
+                cout << (got ? "? " : "X ") << item << "\n";
+            }
+            return 0;
+        }
+
+        string curItem = pools[cur.arr][cur.idx];
+        // 일반 뽑기
+        {
+            State next = cur;
+            if (goalIdx.count(curItem)) next.collectedMask |= (1 << goalIdx[curItem]);
+            next.drawCount++;
+            next.route.push_back("일반 [" + string(1, cur.arr) + "][" + to_string(cur.idx) + "] → 획득: " + curItem);
+            bool switched = false;
+            if (cur.idx - 1 >= 0 && pools[cur.arr][cur.idx - 1] == curItem) {
+                next.idx = cur.idx + (cur.arr == 'A' ? 1 : 2);
+                next.arr = flipArr(cur.arr);
+                switched = true;
+            }
+            if (!switched) {
+                next.idx = cur.idx + 1;
+                next.arr = cur.arr;
+            }
+            pq.push(next);
+        }
+
+        // 10+1 뽑기
+        if (cur.idx + 9 < (int)pools[cur.arr].size()) {
+            State t11 = cur;
+            char tempArr = cur.arr;
+            int tempIdx = cur.idx;
+            // 10번 연속 일반 뽑기 과정에서 idx와 arr 추적
+            for (int j = 0; j < 10; ++j) {
+                int drawIdx = tempIdx;
+                if (drawIdx >= (int)pools[tempArr].size()) break;
+                string it = pools[tempArr][drawIdx];
+                if (goalIdx.count(it)) t11.collectedMask |= (1 << goalIdx[it]);
+                t11.route.push_back("10+1 중 일반 [" + string(1, tempArr) + "][" + to_string(drawIdx) + "] → 획득: " + it);
+
+                if (drawIdx - 1 >= 0 && pools[tempArr][drawIdx - 1] == it) {
+                    tempIdx = drawIdx + (tempArr == 'A' ? 1 : 2);
+                    tempArr = flipArr(tempArr);
+                }
+                else {
+                    tempIdx = drawIdx + 1;
+                }
+            }
+            // 보너스 획득
+            if (cur.arr == 'A' && cur.idx < (int)pools['B'].size()) {
+                string bonus = pools['B'][cur.idx];
+                if (goalIdx.count(bonus)) t11.collectedMask |= (1 << goalIdx[bonus]);
+                t11.route.push_back("10+1 보너스 [B][" + to_string(cur.idx) + "] → 획득: " + bonus);
+            }
+            else if (cur.arr == 'C' && cur.idx < (int)pools['D'].size()) {
+                string bonus = pools['D'][cur.idx];
+                if (goalIdx.count(bonus)) t11.collectedMask |= (1 << goalIdx[bonus]);
+                t11.route.push_back("10+1 보너스 [D][" + to_string(cur.idx) + "] → 획득: " + bonus);
+            }
+            // 배열 전이 (마지막 인덱스 기준)
+            
+            tempIdx += (tempArr == 'A' ? 0 : 1);
+            t11.arr = flipArr(tempArr);
+            t11.idx = tempIdx;
+            t11.tenPlusOneCount += 11;
+            pq.push(t11);
+        }
+    }
+    cout << "\n모든 목표 아이템을 획득할 수 없습니다.\n";
+    return 0;
+}
