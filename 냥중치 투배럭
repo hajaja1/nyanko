@@ -1,0 +1,491 @@
+#include <iostream>
+#include <vector>
+#include <sstream>
+#include <queue>
+#include <unordered_map>
+#include <algorithm>
+#include <memory> 
+#include <limits>
+
+using namespace std;
+
+// --- 상태 및 구조체 정의 ---
+
+struct StateKey {
+    int idx;
+    char arr;
+    char system; // 'X': ABCD, 'Y': EFGH
+    int collectedMask;
+
+    bool operator==(const StateKey& other) const {
+        return idx == other.idx && arr == other.arr && system == other.system && collectedMask == other.collectedMask;
+    }
+};
+
+struct StateKeyHash {
+    size_t operator()(const StateKey& k) const {
+        size_t h = hash<int>()(k.idx) ^ (hash<char>()(k.arr) << 1) ^ (hash<char>()(k.system) << 2);
+        return h ^ (hash<int>()(k.collectedMask) << 3);
+    }
+};
+
+struct PathNode;
+using PathNodePtr = unique_ptr<PathNode>;
+
+struct PathNode {
+    StateKey key;
+    int drawCount;
+    int tenPlusOneCount;
+    string action;
+    PathNode* parent;
+
+    PathNode(const StateKey& k, int dc, int t11c, const string& act, PathNode* p)
+        : key(k), drawCount(dc), tenPlusOneCount(t11c), action(act), parent(p) {
+    }
+};
+
+// A* 검색을 위해 State에 remainingGoals (h(n)) 추가
+struct State {
+    int idx;
+    char arr;
+    char system;
+    int collectedMask;
+    int totalDraws;     // g(n): 실제 비용
+    int remainingGoals; // h(n): 휴리스틱 (남은 목표 아이템 수)
+    PathNode* node;
+
+    bool operator>(const State& other) const {
+        // A* 우선순위: f(n) = g(n) + h(n) 이 작은 쪽이 우선
+        int f_cur = totalDraws + remainingGoals;
+        int f_other = other.totalDraws + other.remainingGoals;
+
+        if (f_cur != f_other) {
+            return f_cur > f_other;
+        }
+        // f(n)이 같으면 g(n)이 작은 쪽 (더 적게 뽑은 쪽)을 우선
+        return totalDraws > other.totalDraws;
+    }
+};
+
+struct PoolTransition {
+    int finalIdx;
+    char finalArr;
+    char finalSystem;
+    int collectedMaskDelta;
+    vector<string> routeDetail;
+};
+
+unordered_map<char, unordered_map<char, unordered_map<int, PoolTransition>>> transitionTable;
+
+// --- 전역 변수 및 헬퍼 함수 ---
+
+unordered_map<string, int> goalIdx;
+unordered_map<char, vector<string>> pools;
+vector<string> currentGoalVec;
+
+vector<string> parseItems(const string& line) {
+    vector<string> result;
+    stringstream ss(line);
+    string token;
+    while (getline(ss, token, '|')) {
+        if (!token.empty()) result.push_back(token);
+    }
+    return result;
+}
+
+inline char flipArr(char a) {
+    if (a == 'A') return 'C';
+    if (a == 'C') return 'A';
+    if (a == 'E') return 'G';
+    if (a == 'G') return 'E';
+    return a;
+}
+
+// 남은 목표 아이템 수 (h(n)) 계산 함수
+int countRemainingGoals(int collectedMask, int M) {
+    int remaining = 0;
+    int goalMaskFull = (1 << M) - 1;
+    int missingMask = goalMaskFull ^ collectedMask;
+
+    // 비트 마스크에서 켜진 비트 수 세기
+    while (missingMask > 0) {
+        missingMask &= (missingMask - 1);
+        remaining++;
+    }
+    return remaining;
+}
+
+// --- DP 테이블 사전 계산 ---
+
+void precomputeTransitions() {
+    if (!transitionTable.empty()) return;
+
+    // 시스템 'X' (시작 A)와 'Y' (시작 E)
+    vector<pair<char, char>> systems = { {'X', 'A'}, {'Y', 'E'} };
+
+    for (const auto& sys_pair : systems) {
+        char system_label = sys_pair.first;
+        char main_arr = sys_pair.second;
+        char other_arr = flipArr(main_arr); // main_arr가 A면 C, E면 G
+
+        for (char arr : {main_arr, other_arr}) {
+            if (pools.find(arr) == pools.end()) continue;
+            const vector<string>& pool = pools[arr];
+
+            for (int startIdx = 0; startIdx < (int)pool.size(); ++startIdx) {
+                char tempArr = arr;
+                int tempIdx = startIdx;
+                vector<string> detail;
+
+                // 10번 연속 일반 뽑기 시뮬레이션
+                for (int j = 0; j < 10; ++j) {
+                    int drawIdx = tempIdx;
+                    if (pools.find(tempArr) == pools.end() || drawIdx >= (int)pools[tempArr].size()) break;
+
+                    string it = pools[tempArr][drawIdx];
+                    string actionStr = "10+1 중 일반 [" + string(1, tempArr) + "][" + to_string(drawIdx) + "] → 획득: " + it;
+                    detail.push_back(actionStr);
+
+                    // 배열 전이 규칙 적용
+                    if (drawIdx - 1 >= 0 && pools[tempArr][drawIdx - 1] == it) {
+                        // Main Array(A, E)에서 Other Array(C, G)로: +1
+                        if (tempArr == main_arr) {
+                            tempIdx = drawIdx + 1;
+                        }
+                        // Other Array(C, G)에서 Main Array(A, E)로: +2 (수정 반영)
+                        else {
+                            tempIdx = drawIdx + 2;
+                        }
+                        tempArr = flipArr(tempArr);
+                    }
+                    else {
+                        tempIdx = drawIdx + 1;
+                    }
+                }
+
+                // 최종 배열 전이 (10회 뽑기 후)
+                tempIdx += (tempArr == main_arr ? 0 : 1);
+                char finalArr = flipArr(tempArr);
+
+                // MaskDelta는 0으로 초기화하고 나중에 계산
+                transitionTable[system_label][arr][startIdx] = { tempIdx, finalArr, system_label, 0, detail };
+            }
+        }
+    }
+}
+
+// MaskDelta 및 [FIND] 재계산
+void calculateMaskDelta() {
+    // ... (기존과 동일) ...
+    for (auto& sys_pair : transitionTable) {
+        for (auto& arr_pair : sys_pair.second) {
+            for (auto& idx_pair : arr_pair.second) {
+                PoolTransition& transition = idx_pair.second;
+                int currentMaskDelta = 0;
+
+                vector<string> newRouteDetail;
+                for (const string& rawAction : transition.routeDetail) {
+                    size_t start = rawAction.find("획득: ") + 5;
+                    string item = rawAction.substr(start);
+
+                    string newAction = rawAction;
+
+                    if (goalIdx.count(item)) {
+                        currentMaskDelta |= (1 << goalIdx[item]);
+                        newAction += " [FIND]";
+                    }
+                    newRouteDetail.push_back(newAction);
+                }
+                transition.collectedMaskDelta = currentMaskDelta;
+                transition.routeDetail = newRouteDetail;
+            }
+        }
+    }
+}
+
+
+// --- A* 메인 루프 함수 ---
+void runDijkstra(int goalMaskFull) {
+
+    unordered_map<StateKey, int, StateKeyHash> min_cost;
+    vector<PathNodePtr> pathNodes;
+    priority_queue<State, vector<State>, greater<State>> pq;
+    const int INF = numeric_limits<int>::max();
+    int M = currentGoalVec.size();
+
+    // 두 가지 시작점 (A, E)을 큐에 추가
+    vector<pair<char, char>> start_points = { {'A', 'X'}, {'E', 'Y'} };
+
+    for (const auto& start_pair : start_points) {
+        char start_arr = start_pair.first;
+        char start_system = start_pair.second;
+
+        if (pools.count(start_arr)) {
+            StateKey startKey = { 0, start_arr, start_system, 0 };
+
+            pathNodes.push_back(make_unique<PathNode>(
+                startKey, 0, 0, "시작 (배열 " + string(1, start_arr) + ")", nullptr
+            ));
+            PathNode* startNode = pathNodes.back().get();
+
+            min_cost[startKey] = 0;
+            // A* 시작: totalDraws=0, remainingGoals=M
+            pq.push({ 0, start_arr, start_system, 0, 0, M, startNode });
+        }
+    }
+
+    PathNode* finalNode = nullptr;
+
+    while (!pq.empty()) {
+        State cur = pq.top(); pq.pop();
+
+        StateKey curKey = { cur.idx, cur.arr, cur.system, cur.collectedMask };
+        if (cur.totalDraws > (min_cost.count(curKey) ? min_cost[curKey] : INF)) continue;
+
+        if (cur.collectedMask == goalMaskFull) {
+            finalNode = cur.node;
+            break;
+        }
+
+        if (cur.arr != 'A' && cur.arr != 'C' && cur.arr != 'E' && cur.arr != 'G') continue;
+        if (pools.find(cur.arr) == pools.end() || cur.idx >= (int)pools[cur.arr].size()) continue;
+
+        string curItem = pools[cur.arr][cur.idx];
+
+        // 시스템 메인 배열 판별
+        char current_main = (cur.system == 'X' ? 'A' : 'E');
+        char current_other = flipArr(current_main);
+
+        // --- 1. 일반 뽑기 ---
+        {
+            State next = cur;
+            int nextMask = cur.collectedMask;
+            bool isGoal = goalIdx.count(curItem);
+            if (isGoal) nextMask |= (1 << goalIdx[curItem]);
+
+            int nextDrawCount = cur.node->drawCount + 1;
+            int nextTenPlusOneCount = cur.node->tenPlusOneCount;
+            int nextTotalDraws = nextDrawCount + nextTenPlusOneCount;
+
+            bool switched = false;
+
+            if (cur.idx - 1 >= 0 && pools[cur.arr][cur.idx - 1] == curItem) {
+                // 배열 전이 규칙 적용: A/E -> C/G (+1), C/G -> A/E (+2)
+                if (cur.arr == current_main) { // A/E에서 전이
+                    next.idx = cur.idx + 1;
+                }
+                else { // C/G에서 전이 (요청 반영)
+                    next.idx = cur.idx + 2;
+                }
+                next.arr = flipArr(cur.arr);
+                switched = true;
+            }
+            if (!switched) {
+                next.idx = cur.idx + 1;
+                next.arr = cur.arr;
+            }
+            next.collectedMask = nextMask;
+            next.totalDraws = nextTotalDraws;
+
+            string actionStr = "일반 [" + string(1, cur.arr) + "][" + to_string(cur.idx) + "] → 획득: " + curItem;
+            if (isGoal) actionStr += " [FIND]";
+
+            StateKey nextKey = { next.idx, next.arr, next.system, next.collectedMask };
+            if (nextTotalDraws < (min_cost.count(nextKey) ? min_cost[nextKey] : INF)) {
+                min_cost[nextKey] = nextTotalDraws;
+
+                pathNodes.push_back(make_unique<PathNode>(
+                    nextKey, nextDrawCount, nextTenPlusOneCount,
+                    actionStr,
+                    cur.node
+                ));
+                PathNode* nextNode = pathNodes.back().get();
+
+                int remaining = countRemainingGoals(nextMask, M);
+                pq.push({ next.idx, next.arr, next.system, nextMask, nextTotalDraws, remaining, nextNode });
+            }
+        }
+
+        // --- 2. 10+1 뽑기 (DP 테이블 사용) ---
+        if (transitionTable.count(cur.system) && transitionTable[cur.system].count(cur.arr) && transitionTable[cur.system][cur.arr].count(cur.idx)) {
+            const auto& transition = transitionTable[cur.system][cur.arr][cur.idx];
+            int nextMask = cur.collectedMask | transition.collectedMaskDelta;
+
+            char bonusArr;
+            if (cur.arr == 'A') bonusArr = 'B';
+            else if (cur.arr == 'C') bonusArr = 'D';
+            else if (cur.arr == 'E') bonusArr = 'F';
+            else bonusArr = 'H';
+            int bonusIdx = cur.idx;
+
+            string bonusActionStr = "";
+            if (pools.count(bonusArr) && bonusIdx < (int)pools[bonusArr].size()) {
+                string bonus = pools[bonusArr][bonusIdx];
+                bool isGoal = goalIdx.count(bonus);
+                if (isGoal) nextMask |= (1 << goalIdx[bonus]);
+
+                bonusActionStr = "10+1 보너스 [" + string(1, bonusArr) + "][" + to_string(bonusIdx) + "] → 획득: " + bonus;
+                if (isGoal) bonusActionStr += " [FIND]";
+            }
+
+            int nextDrawCount = cur.node->drawCount;
+            int nextTenPlusOneCount = cur.node->tenPlusOneCount + 11;
+            int nextTotalDraws = nextDrawCount + nextTenPlusOneCount;
+
+            StateKey nextKey = { transition.finalIdx, transition.finalArr, transition.finalSystem, nextMask };
+
+            if (nextTotalDraws < (min_cost.count(nextKey) ? min_cost[nextKey] : INF)) {
+                min_cost[nextKey] = nextTotalDraws;
+
+                string combinedAction = "10+1: 11회 뽑기. [" + string(1, cur.arr) + "][" + to_string(cur.idx) + "] 부터 시작 (시스템 " + string(1, cur.system) + ").\n";
+                for (const auto& detail : transition.routeDetail) {
+                    combinedAction += "  - " + detail + "\n";
+                }
+                if (!bonusActionStr.empty()) {
+                    combinedAction += "  - " + bonusActionStr + "\n";
+                }
+                combinedAction += " [다음 시스템: " + string(1, transition.finalSystem) + ", 다음 배열: " + string(1, transition.finalArr) + ", 다음 인덱스: " + to_string(transition.finalIdx) + "]";
+
+                pathNodes.push_back(make_unique<PathNode>(
+                    nextKey, nextDrawCount, nextTenPlusOneCount,
+                    combinedAction,
+                    cur.node
+                ));
+                PathNode* nextNode = pathNodes.back().get();
+
+                int remaining = countRemainingGoals(nextMask, M);
+                pq.push({ transition.finalIdx, transition.finalArr, transition.finalSystem, nextMask, nextTotalDraws, remaining, nextNode });
+            }
+        }
+
+        // --- 3. 독립 배열 시스템 전환 (비용 0) ---
+        char target_arr = (cur.system == 'X' ?
+            (cur.arr == 'A' ? 'E' : 'G') :
+            (cur.arr == 'E' ? 'A' : 'C'));
+        char target_system = (cur.system == 'X' ? 'Y' : 'X');
+
+        StateKey nextKey = { cur.idx, target_arr, target_system, cur.collectedMask };
+
+        if (pools.count(target_arr) && cur.idx < (int)pools[target_arr].size()) {
+            int nextTotalDraws = cur.totalDraws;
+
+            if (nextTotalDraws < (min_cost.count(nextKey) ? min_cost[nextKey] : INF)) {
+                min_cost[nextKey] = nextTotalDraws;
+
+                string actionStr = "시스템 전환: " + string(1, cur.system) + "→" + string(1, target_system) +
+                    " [" + string(1, cur.arr) + "][" + to_string(cur.idx) + "] → [" + string(1, target_arr) + "][" + to_string(cur.idx) + "]";
+
+                pathNodes.push_back(make_unique<PathNode>(
+                    nextKey, cur.node->drawCount, cur.node->tenPlusOneCount,
+                    actionStr,
+                    cur.node
+                ));
+                PathNode* nextNode = pathNodes.back().get();
+
+                // 시스템 전환은 마스크가 변하지 않으므로 remainingGoals 유지
+                pq.push({ cur.idx, target_arr, target_system, cur.collectedMask, nextTotalDraws, cur.remainingGoals, nextNode });
+            }
+        }
+    }
+
+    // --- 결과 출력 (경로 역추적) ---
+    cout << "\n========================================\n";
+    if (finalNode) {
+        vector<string> finalRoute;
+        PathNode* current = finalNode;
+        int totalDraws = finalNode->drawCount + finalNode->tenPlusOneCount;
+        int drawCount = finalNode->drawCount;
+        int tenPlusOneCount = finalNode->tenPlusOneCount / 11;
+
+        while (current && current->parent != nullptr) {
+            finalRoute.push_back(current->action);
+            current = current->parent;
+        }
+        reverse(finalRoute.begin(), finalRoute.end());
+
+        cout << "🎯 목표 아이템 배열: ";
+        for (size_t i = 0; i < currentGoalVec.size(); ++i) {
+            cout << currentGoalVec[i] << (i == currentGoalVec.size() - 1 ? "" : "|");
+        }
+        cout << "\n\n";
+
+        cout << "🌟 최소 뽑기 횟수: **" << totalDraws << "회**\n";
+        cout << "일반 뽑기: " << drawCount << "회 | 10+1 뽑기: " << tenPlusOneCount << "회\n";
+
+        cout << "\n### [최단 뽑기 경로 상세 내역]\n";
+        for (auto& step : finalRoute) {
+            if (step.find("10+1: 11회 뽑기") != string::npos) {
+                cout << "--- 10+1 시작 ---\n";
+                cout << step;
+                cout << "\n--- 10+1 종료 ---\n";
+            }
+            else {
+                cout << "- " << step << "\n";
+            }
+        }
+
+        cout << "\n### [목표 아이템 최종 획득 현황]\n";
+        for (auto& item : currentGoalVec) {
+            bool got = (finalNode->key.collectedMask & (1 << goalIdx[item])) != 0;
+            cout << (got ? "✅ " : "❌ ") << item << "\n";
+        }
+    }
+    else {
+        cout << "🚫 해당 목표 아이템 배열을 획득할 수 없습니다.\n";
+    }
+    cout << "========================================\n";
+}
+
+
+int main() {
+    ios_base::sync_with_stdio(false);
+    cin.tie(NULL);
+
+    vector<char> labels = { 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H' };
+
+    // --- 1. 배열 입력 (한 번만 실행) ---
+    cout << "===== 배열 입력 (아이템은 '|'로 구분) =====\n";
+    for (char label : labels) {
+        cout << "배열 " << label << ": ";
+        string line; getline(cin, line);
+        pools[label] = parseItems(line);
+    }
+
+    // DP 테이블 사전 계산 (시스템 X/Y 모두 포함)
+    precomputeTransitions();
+
+    // --- 2. 목표 아이템 반복 입력 및 실행 ---
+    cout << "\n========================================\n";
+    cout << "⭐️ 목표 아이템 입력 (아이템은 '|'로 구분)\n";
+    cout << "   - 빈 줄을 입력하면 프로그램이 종료됩니다.\n";
+    cout << "========================================\n";
+
+    string goalLine;
+    while (true) {
+        cout << "\n목표 아이템 입력: ";
+        if (!getline(cin, goalLine) || goalLine.empty()) {
+            break;
+        }
+
+        currentGoalVec = parseItems(goalLine);
+
+        goalIdx.clear();
+        for (int i = 0; i < (int)currentGoalVec.size(); ++i) goalIdx[currentGoalVec[i]] = i;
+
+        if (currentGoalVec.size() > 31) {
+            cout << "⚠️ 목표 아이템은 최대 31개까지만 지원됩니다. 다시 입력해주세요.\n";
+            continue;
+        }
+
+        int goalMaskFull = (1 << (int)currentGoalVec.size()) - 1;
+
+        // DP 테이블의 MaskDelta 및 [FIND] 표시를 현재 목표에 맞게 재계산
+        calculateMaskDelta();
+
+        // A* 실행
+        runDijkstra(goalMaskFull);
+    }
+
+    cout << "\n프로그램을 종료합니다.\n";
+    return 0;
+}
